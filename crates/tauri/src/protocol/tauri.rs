@@ -163,7 +163,16 @@ fn get_response<R: Runtime>(
           r
         } else {
           let status = r.status();
-          let headers = r.headers().clone();
+          let mut headers = r.headers().clone();
+
+          // Set Content-Security-Policy header from Tauri config
+          if let Some(csp) = manager.csp() {
+            headers.insert(
+              http::header::CONTENT_SECURITY_POLICY,
+              http::HeaderValue::from_str(&csp.to_string())?,
+            );
+          }
+
           let body = crate::async_runtime::safe_block_on(r.bytes())?;
           let response = CachedResponse {
             status,
