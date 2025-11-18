@@ -1,5 +1,21 @@
 # Changelog
 
+## \[2.9.5]
+
+### Bug Fixes
+
+- [`f855caf8a`](https://www.github.com/tauri-apps/tauri/commit/f855caf8a3830aa5dd6d0b039312866a5d9c3606) ([#14481](https://www.github.com/tauri-apps/tauri/pull/14481) by [@Legend-Master](https://www.github.com/tauri-apps/tauri/../../Legend-Master)) Fixed the mismatched tauri package versions check didn't work for pnpm
+
+### Performance Improvements
+
+- [`ce98d87ce`](https://www.github.com/tauri-apps/tauri/commit/ce98d87ce0aaa907285852eb80691197424e03c3) ([#14474](https://www.github.com/tauri-apps/tauri/pull/14474) by [@Tunglies](https://www.github.com/tauri-apps/tauri/../../Tunglies)) refactor: remove needless collect. No user facing changes.
+- [`ee3cc4a91`](https://www.github.com/tauri-apps/tauri/commit/ee3cc4a91bf1315ecaefe90f423ffd55ef6c40db) ([#14475](https://www.github.com/tauri-apps/tauri/pull/14475) by [@Tunglies](https://www.github.com/tauri-apps/tauri/../../Tunglies)) perf: remove needless clones in various files for improved performance. No user facing changes.
+
+### Dependencies
+
+- Upgraded to `tauri-bundler@2.7.4`
+- Upgraded to `tauri-macos-sign@2.3.1`
+
 ## \[2.9.4]
 
 ### Bug Fixes
