@@ -33,7 +33,7 @@ fn main() {
     let job = win32job::Job::create().unwrap();
     let mut info = job.query_extended_limit_info().unwrap();
     info.limit_kill_on_job_close();
-    job.set_extended_limit_info(&mut info).unwrap();
+    job.set_extended_limit_info(&info).unwrap();
     job.assign_current_process().unwrap();
     job
   };
@@ -46,7 +46,7 @@ fn main() {
 
   // start our webdriver intermediary node
   if let Err(e) = server::run(args, driver) {
-    eprintln!("error while running server: {}", e);
+    eprintln!("error while running server: {e}");
     std::process::exit(1);
   }
 }

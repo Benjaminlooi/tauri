@@ -12,11 +12,14 @@
   html_favicon_url = "https://github.com/tauri-apps/tauri/raw/dev/.github/icon.png"
 )]
 
+use self::monitor::MonitorExt;
 use http::Request;
-#[cfg(desktop)]
-use monitor::MonitorExt;
+#[cfg(target_os = "macos")]
+use objc2::ClassType;
 use raw_window_handle::{DisplayHandle, HasDisplayHandle, HasWindowHandle};
 
+#[cfg(windows)]
+use tauri_runtime::webview::ScrollBarStyle;
 use tauri_runtime::{
   dpi::{LogicalPosition, LogicalSize, PhysicalPosition, PhysicalSize, Position, Size},
   monitor::Monitor,
@@ -39,11 +42,13 @@ use tao::platform::unix::{WindowBuilderExtUnix, WindowExtUnix};
 #[cfg(windows)]
 use tao::platform::windows::{WindowBuilderExtWindows, WindowExtWindows};
 #[cfg(windows)]
-use webview2_com::FocusChangedEventHandler;
+use webview2_com::{ContainsFullScreenElementChangedEventHandler, FocusChangedEventHandler};
 #[cfg(windows)]
 use windows::Win32::Foundation::HWND;
 #[cfg(target_os = "ios")]
 use wry::WebViewBuilderExtIos;
+#[cfg(target_os = "macos")]
+use wry::WebViewBuilderExtMacos;
 #[cfg(windows)]
 use wry::WebViewBuilderExtWindows;
 #[cfg(target_vendor = "apple")]
@@ -76,6 +81,8 @@ use tauri_utils::{
   Theme,
 };
 use url::Url;
+#[cfg(windows)]
+use wry::ScrollBarStyle as WryScrollBarStyle;
 use wry::{
   DragDropEvent as WryDragDropEvent, ProxyConfig, ProxyEndpoint, WebContext as WryWebContext,
   WebView, WebViewBuilder,
@@ -131,7 +138,8 @@ use std::{
 pub type WebviewId = u32;
 type IpcHandler = dyn Fn(Request<String>) + 'static;
 
-#[cfg(desktop)]
+#[cfg(not(debug_assertions))]
+mod dialog;
 mod monitor;
 #[cfg(any(
   windows,
@@ -173,7 +181,7 @@ impl WindowIdStore {
     self.0.lock().unwrap().insert(w, id);
   }
 
-  fn get(&self, w: &TaoWindowId) -> Option<WindowId> {
+  pub fn get(&self, w: &TaoWindowId) -> Option<WindowId> {
     self.0.lock().unwrap().get(w).copied()
   }
 }
@@ -250,6 +258,7 @@ pub struct Context<T: UserEvent> {
   next_webview_id: Arc<AtomicU32>,
   next_window_event_id: Arc<AtomicU32>,
   next_webview_event_id: Arc<AtomicU32>,
+  webview_runtime_installed: bool,
 }
 
 impl<T: UserEvent> Context<T> {
@@ -411,7 +420,7 @@ pub enum ActiveTracingSpan {
 }
 
 #[derive(Debug)]
-pub struct WindowsStore(RefCell<BTreeMap<WindowId, WindowWrapper>>);
+pub struct WindowsStore(pub RefCell<BTreeMap<WindowId, WindowWrapper>>);
 
 // SAFETY: we ensure this type is only used on the main thread.
 #[allow(clippy::non_send_fields_in_send_ty)]
@@ -462,8 +471,8 @@ impl From<DeviceEventFilter> for DeviceEventFilterWrapper {
 }
 
 pub struct RectWrapper(pub wry::Rect);
-impl From<tauri_runtime::Rect> for RectWrapper {
-  fn from(value: tauri_runtime::Rect) -> Self {
+impl From<tauri_runtime::dpi::Rect> for RectWrapper {
+  fn from(value: tauri_runtime::dpi::Rect) -> Self {
     RectWrapper(wry::Rect {
       position: value.position,
       size: value.size,
@@ -518,7 +527,7 @@ impl WindowEventWrapper {
           if !*focused
             && focused_webview
               .as_deref()
-              .map_or(false, |w| w != FOCUSED_WEBVIEW_MARKER)
+              .is_some_and(|w| w != FOCUSED_WEBVIEW_MARKER)
           {
             return Self(None);
           }
@@ -586,6 +595,7 @@ impl From<MonitorHandleWrapper> for Monitor {
       name: monitor.0.name(),
       position: PhysicalPositionWrapper(monitor.0.position()).into(),
       size: PhysicalSizeWrapper(monitor.0.size()).into(),
+      work_area: monitor.0.work_area(),
       scale_factor: monitor.0.scale_factor(),
     }
   }
@@ -802,7 +812,7 @@ impl WindowBuilder for WindowBuilderWrapper {
     {
       // TODO: find a proper way to prevent webview being pushed out of the window.
       // Workround for issue: https://github.com/tauri-apps/tauri/issues/10225
-      // The window requies `NSFullSizeContentViewWindowMask` flag to prevent devtools
+      // The window requires `NSFullSizeContentViewWindowMask` flag to prevent devtools
       // pushing the content view out of the window.
       // By setting the default style to `TitleBarStyle::Visible` should fix the issue for most of the users.
       builder = builder.title_bar_style(TitleBarStyle::Visible);
@@ -864,6 +874,7 @@ impl WindowBuilder for WindowBuilderWrapper {
         .title(config.title.to_string())
         .inner_size(config.width, config.height)
         .focused(config.focus)
+        .focusable(config.focusable)
         .visible(config.visible)
         .resizable(config.resizable)
         .fullscreen(config.fullscreen)
@@ -970,7 +981,6 @@ impl WindowBuilder for WindowBuilderWrapper {
   /// ## Platform-specific
   ///
   /// - **iOS / Android:** Unsupported.
-  #[must_use]
   fn prevent_overflow(mut self) -> Self {
     self
       .prevent_overflow
@@ -984,7 +994,6 @@ impl WindowBuilder for WindowBuilderWrapper {
   /// ## Platform-specific
   ///
   /// - **iOS / Android:** Unsupported.
-  #[must_use]
   fn prevent_overflow_with_margin(mut self, margin: Size) -> Self {
     self.prevent_overflow.replace(margin);
     self
@@ -1028,6 +1037,11 @@ impl WindowBuilder for WindowBuilderWrapper {
 
   fn focused(mut self, focused: bool) -> Self {
     self.inner = self.inner.with_focused(focused);
+    self
+  }
+
+  fn focusable(mut self, focusable: bool) -> Self {
+    self.inner = self.inner.with_focusable(focusable);
     self
   }
 
@@ -1348,7 +1362,10 @@ pub enum WindowMessage {
   SetSizeConstraints(WindowSizeConstraints),
   SetPosition(Position),
   SetFullscreen(bool),
+  #[cfg(target_os = "macos")]
+  SetSimpleFullscreen(bool),
   SetFocus,
+  SetFocusable(bool),
   SetIcon(TaoWindowIcon),
   SetSkipTaskbar(bool),
   SetCursorGrab(bool),
@@ -1393,6 +1410,8 @@ pub enum WebviewMessage {
   EvaluateScript(String, Sender<()>, tracing::Span),
   CookiesForUrl(Url, Sender<Result<Vec<tauri_runtime::Cookie<'static>>>>),
   Cookies(Sender<Result<Vec<tauri_runtime::Cookie<'static>>>>),
+  SetCookie(tauri_runtime::Cookie<'static>),
+  DeleteCookie(tauri_runtime::Cookie<'static>),
   WebviewEvent(WebviewEvent),
   SynthesizedWindowEvent(SynthesizedWindowEvent),
   Navigate(Url),
@@ -1403,7 +1422,7 @@ pub enum WebviewMessage {
   Hide,
   SetPosition(Position),
   SetSize(Size),
-  SetBounds(tauri_runtime::Rect),
+  SetBounds(tauri_runtime::dpi::Rect),
   SetFocus,
   Reparent(WindowId, Sender<Result<()>>),
   SetAutoResize(bool),
@@ -1412,7 +1431,7 @@ pub enum WebviewMessage {
   ClearAllBrowsingData,
   // Getters
   Url(Sender<Result<String>>),
-  Bounds(Sender<Result<tauri_runtime::Rect>>),
+  Bounds(Sender<Result<tauri_runtime::dpi::Rect>>),
   Position(Sender<Result<PhysicalPosition<i32>>>),
   Size(Sender<Result<PhysicalSize<u32>>>),
   WithWebview(Box<dyn FnOnce(Webview) + Send>),
@@ -1427,6 +1446,8 @@ pub enum WebviewMessage {
 
 pub enum EventLoopWindowTargetMessage {
   CursorPosition(Sender<Result<PhysicalPosition<f64>>>),
+  SetTheme(Option<Theme>),
+  SetDeviceEventFilter(DeviceEventFilter),
 }
 
 pub type CreateWindowClosure<T> =
@@ -1541,7 +1562,7 @@ impl<T: UserEvent> WebviewDispatch<T> for WryWebviewDispatcher<T> {
     webview_getter!(self, WebviewMessage::Url)?
   }
 
-  fn bounds(&self) -> Result<tauri_runtime::Rect> {
+  fn bounds(&self) -> Result<tauri_runtime::dpi::Rect> {
     webview_getter!(self, WebviewMessage::Bounds)?
   }
 
@@ -1599,7 +1620,7 @@ impl<T: UserEvent> WebviewDispatch<T> for WryWebviewDispatcher<T> {
     )
   }
 
-  fn set_bounds(&self, bounds: tauri_runtime::Rect) -> Result<()> {
+  fn set_bounds(&self, bounds: tauri_runtime::dpi::Rect) -> Result<()> {
     send_user_message(
       &self.context,
       Message::Webview(
@@ -1678,6 +1699,30 @@ impl<T: UserEvent> WebviewDispatch<T> for WryWebviewDispatcher<T> {
 
   fn cookies(&self) -> Result<Vec<Cookie<'static>>> {
     webview_getter!(self, WebviewMessage::Cookies)?
+  }
+
+  fn set_cookie(&self, cookie: Cookie<'_>) -> Result<()> {
+    send_user_message(
+      &self.context,
+      Message::Webview(
+        *self.window_id.lock().unwrap(),
+        self.webview_id,
+        WebviewMessage::SetCookie(cookie.into_owned()),
+      ),
+    )?;
+    Ok(())
+  }
+
+  fn delete_cookie(&self, cookie: Cookie<'_>) -> Result<()> {
+    send_user_message(
+      &self.context,
+      Message::Webview(
+        *self.window_id.lock().unwrap(),
+        self.webview_id,
+        WebviewMessage::DeleteCookie(cookie.into_owned()),
+      ),
+    )?;
+    Ok(())
   }
 
   fn set_auto_resize(&self, auto_resize: bool) -> Result<()> {
@@ -2189,10 +2234,25 @@ impl<T: UserEvent> WindowDispatch<T> for WryWindowDispatcher<T> {
     )
   }
 
+  #[cfg(target_os = "macos")]
+  fn set_simple_fullscreen(&self, enable: bool) -> Result<()> {
+    send_user_message(
+      &self.context,
+      Message::Window(self.window_id, WindowMessage::SetSimpleFullscreen(enable)),
+    )
+  }
+
   fn set_focus(&self) -> Result<()> {
     send_user_message(
       &self.context,
       Message::Window(self.window_id, WindowMessage::SetFocus),
+    )
+  }
+
+  fn set_focusable(&self, focusable: bool) -> Result<()> {
+    send_user_message(
+      &self.context,
+      Message::Window(self.window_id, WindowMessage::SetFocusable(focusable)),
     )
   }
 
@@ -2387,6 +2447,12 @@ pub struct WindowWrapper {
   focused_webview: Arc<Mutex<Option<String>>>,
 }
 
+impl WindowWrapper {
+  pub fn label(&self) -> &str {
+    &self.label
+  }
+}
+
 impl fmt::Debug for WindowWrapper {
   fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
     f.debug_struct("WindowWrapper")
@@ -2556,7 +2622,9 @@ impl<T: UserEvent> RuntimeHandle<T> for WryHandle<T> {
     send_user_message(&self.context, Message::Task(Box::new(f)))
   }
 
-  fn display_handle(&self) -> std::result::Result<DisplayHandle, raw_window_handle::HandleError> {
+  fn display_handle(
+    &self,
+  ) -> std::result::Result<DisplayHandle<'_>, raw_window_handle::HandleError> {
     self.context.main_thread.window_target.display_handle()
   }
 
@@ -2596,15 +2664,10 @@ impl<T: UserEvent> RuntimeHandle<T> for WryHandle<T> {
   }
 
   fn set_theme(&self, theme: Option<Theme>) {
-    self
-      .context
-      .main_thread
-      .window_target
-      .set_theme(match theme {
-        Some(Theme::Light) => Some(TaoTheme::Light),
-        Some(Theme::Dark) => Some(TaoTheme::Dark),
-        _ => None,
-      });
+    let _ = send_user_message(
+      &self.context,
+      Message::EventLoopWindowTarget(EventLoopWindowTargetMessage::SetTheme(theme)),
+    );
   }
 
   #[cfg(target_os = "macos")]
@@ -2621,6 +2684,13 @@ impl<T: UserEvent> RuntimeHandle<T> for WryHandle<T> {
       &self.context,
       Message::Application(ApplicationMessage::Hide),
     )
+  }
+
+  fn set_device_event_filter(&self, filter: DeviceEventFilter) {
+    let _ = send_user_message(
+      &self.context,
+      Message::EventLoopWindowTarget(EventLoopWindowTargetMessage::SetDeviceEventFilter(filter)),
+    );
   }
 
   #[cfg(target_os = "android")]
@@ -2713,6 +2783,7 @@ impl<T: UserEvent> Wry<T> {
       next_webview_id: Default::default(),
       next_window_event_id: Default::default(),
       next_webview_event_id: Default::default(),
+      webview_runtime_installed: wry::webview_version().is_ok(),
     };
 
     Ok(Self {
@@ -2912,18 +2983,18 @@ impl<T: UserEvent> Runtime<T> for Wry<T> {
   }
 
   fn cursor_position(&self) -> Result<PhysicalPosition<f64>> {
-    event_loop_window_getter!(self, EventLoopWindowTargetMessage::CursorPosition)?
+    self
+      .context
+      .main_thread
+      .window_target
+      .cursor_position()
       .map(PhysicalPositionWrapper)
       .map(Into::into)
       .map_err(|_| Error::FailedToGetCursorPosition)
   }
 
   fn set_theme(&self, theme: Option<Theme>) {
-    self.event_loop.set_theme(match theme {
-      Some(Theme::Light) => Some(TaoTheme::Light),
-      Some(Theme::Dark) => Some(TaoTheme::Dark),
-      _ => None,
-    });
+    self.event_loop.set_theme(to_tao_theme(theme));
   }
 
   #[cfg(target_os = "macos")]
@@ -3317,8 +3388,17 @@ fn handle_user_message<T: UserEvent>(
               window.set_fullscreen(None)
             }
           }
+
+          #[cfg(target_os = "macos")]
+          WindowMessage::SetSimpleFullscreen(enable) => {
+            window.set_simple_fullscreen(enable);
+          }
+
           WindowMessage::SetFocus => {
             window.set_focus();
+          }
+          WindowMessage::SetFocusable(focusable) => {
+            window.set_focusable(focusable);
           }
           WindowMessage::SetIcon(icon) => {
             window.set_window_icon(Some(icon));
@@ -3419,11 +3499,7 @@ fn handle_user_message<T: UserEvent>(
             window.set_traffic_light_inset(_position);
           }
           WindowMessage::SetTheme(theme) => {
-            window.set_theme(match theme {
-              Some(Theme::Light) => Some(TaoTheme::Light),
-              Some(Theme::Dark) => Some(TaoTheme::Dark),
-              _ => None,
-            });
+            window.set_theme(to_tao_theme(theme));
           }
           WindowMessage::SetBackgroundColor(color) => {
             window.set_background_color(color.map(Into::into))
@@ -3520,14 +3596,14 @@ fn handle_user_message<T: UserEvent>(
           WebviewMessage::EvaluateScript(script, tx, span) => {
             let _span = span.entered();
             if let Err(e) = webview.evaluate_script(&script) {
-              log::error!("{}", e);
+              log::error!("{e}");
             }
             tx.send(()).unwrap();
           }
           #[cfg(not(all(feature = "tracing", not(target_os = "android"))))]
           WebviewMessage::EvaluateScript(script) => {
             if let Err(e) = webview.evaluate_script(&script) {
-              log::error!("{}", e);
+              log::error!("{e}");
             }
           }
           WebviewMessage::Navigate(url) => {
@@ -3656,6 +3732,18 @@ fn handle_user_message<T: UserEvent>(
               .unwrap();
           }
 
+          WebviewMessage::SetCookie(cookie) => {
+            if let Err(e) = webview.set_cookie(&cookie) {
+              log::error!("failed to set webview cookie: {e}");
+            }
+          }
+
+          WebviewMessage::DeleteCookie(cookie) => {
+            if let Err(e) = webview.delete_cookie(&cookie) {
+              log::error!("failed to delete webview cookie: {e}");
+            }
+          }
+
           WebviewMessage::CookiesForUrl(url, tx) => {
             let webview_cookies = webview
               .cookies_for_url(url.as_str())
@@ -3667,7 +3755,7 @@ fn handle_user_message<T: UserEvent>(
             tx.send(
               webview
                 .bounds()
-                .map(|bounds| tauri_runtime::Rect {
+                .map(|bounds| tauri_runtime::dpi::Rect {
                   size: bounds.size,
                   position: bounds.position,
                 })
@@ -3760,6 +3848,7 @@ fn handle_user_message<T: UserEvent>(
             {
               f(Webview {
                 controller: webview.controller(),
+                environment: webview.environment(),
               });
             }
             #[cfg(target_os = "android")]
@@ -3799,17 +3888,21 @@ fn handle_user_message<T: UserEvent>(
             });
           }
           Err(e) => {
-            log::error!("{}", e);
+            log::error!("{e}");
           }
         }
       }
     }
     Message::CreateWindow(window_id, handler) => match handler(event_loop) {
-      Ok(webview) => {
-        windows.0.borrow_mut().insert(window_id, webview);
-      }
+      // wait for borrow_mut to be available - on Windows we might poll for the window to be inserted
+      Ok(webview) => loop {
+        if let Ok(mut windows) = windows.0.try_borrow_mut() {
+          windows.insert(window_id, webview);
+          break;
+        }
+      },
       Err(e) => {
-        log::error!("{}", e);
+        log::error!("{e}");
       }
     },
     Message::CreateRawWindow(window_id, handler, sender) => {
@@ -3871,6 +3964,12 @@ fn handle_user_message<T: UserEvent>(
           .cursor_position()
           .map_err(|_| Error::FailedToSendMessage);
         sender.send(pos).unwrap();
+      }
+      EventLoopWindowTargetMessage::SetTheme(theme) => {
+        event_loop.set_theme(to_tao_theme(theme));
+      }
+      EventLoopWindowTargetMessage::SetDeviceEventFilter(filter) => {
+        event_loop.set_device_event_filter(DeviceEventFilterWrapper::from(filter).0);
       }
     },
   }
@@ -4226,12 +4325,12 @@ fn create_window<T: UserEvent, F: Fn(RawWindow) + Send + 'static>(
         let monitor_size = m.size();
 
         // type annotations required for 32bit targets.
-        let window_position: LogicalPosition<i32> = window_position.to_logical(m.scale_factor());
+        let window_position = window_position.to_physical::<i32>(m.scale_factor());
 
         monitor_pos.x <= window_position.x
-          && window_position.x <= monitor_pos.x + monitor_size.width as i32
+          && window_position.x < monitor_pos.x + monitor_size.width as i32
           && monitor_pos.y <= window_position.y
-          && window_position.y <= monitor_pos.y + monitor_size.height as i32
+          && window_position.y < monitor_pos.y + monitor_size.height as i32
       })
     } else {
       event_loop.primary_monitor()
@@ -4299,7 +4398,10 @@ fn create_window<T: UserEvent, F: Fn(RawWindow) + Send + 'static>(
     }
   };
 
-  let window = window_builder.inner.build(event_loop).unwrap();
+  let window = window_builder
+    .inner
+    .build(event_loop)
+    .map_err(|_| Error::CreateWindow)?;
 
   #[cfg(feature = "tracing")]
   {
@@ -4422,6 +4524,24 @@ fn create_webview<T: UserEvent>(
   pending: PendingWebview<T, Wry<T>>,
   #[allow(unused_variables)] focused_webview: Arc<Mutex<Option<String>>>,
 ) -> Result<WebviewWrapper> {
+  if !context.webview_runtime_installed {
+    #[cfg(all(not(debug_assertions), windows))]
+    dialog::error(
+      r#"Could not find the WebView2 Runtime.
+
+Make sure it is installed or download it from <A href="https://developer.microsoft.com/en-us/microsoft-edge/webview2">https://developer.microsoft.com/en-us/microsoft-edge/webview2</A>
+
+You may have it installed on another user account, but it is not available for this one.
+"#,
+    );
+
+    if cfg!(target_os = "macos") {
+      log::warn!("WebKit webview runtime not found, attempting to create webview anyway.");
+    } else {
+      return Err(Error::WebviewRuntimeNotInstalled);
+    }
+  }
+
   #[allow(unused_mut)]
   let PendingWebview {
     webview_attributes,
@@ -4463,15 +4583,23 @@ fn create_webview<T: UserEvent>(
     }
   };
 
-  let mut webview_builder = WebViewBuilder::with_web_context(&mut web_context.inner)
+  let mut webview_builder = WebViewBuilder::new_with_web_context(&mut web_context.inner)
     .with_id(&label)
     .with_focused(webview_attributes.focus)
-    .with_url(&url)
     .with_transparent(webview_attributes.transparent)
     .with_accept_first_mouse(webview_attributes.accept_first_mouse)
     .with_incognito(webview_attributes.incognito)
     .with_clipboard(webview_attributes.clipboard)
     .with_hotkeys_zoom(webview_attributes.zoom_hotkeys_enabled);
+
+  if url != "about:blank" {
+    webview_builder = webview_builder.with_url(&url);
+  }
+
+  #[cfg(target_os = "macos")]
+  if let Some(webview_configuration) = webview_attributes.webview_configuration {
+    webview_builder = webview_builder.with_webview_configuration(webview_configuration);
+  }
 
   #[cfg(any(target_os = "windows", target_os = "android"))]
   {
@@ -4544,6 +4672,75 @@ fn create_webview<T: UserEvent>(
         .map(|url| navigation_handler(&url))
         .unwrap_or(true)
     });
+  }
+
+  if let Some(new_window_handler) = pending.new_window_handler {
+    #[cfg(desktop)]
+    let context = context.clone();
+    webview_builder = webview_builder.with_new_window_req_handler(move |url, features| {
+      url
+        .parse()
+        .map(|url| {
+          let response = new_window_handler(
+            url,
+            tauri_runtime::webview::NewWindowFeatures::new(
+              features.size,
+              features.position,
+              tauri_runtime::webview::NewWindowOpener {
+                #[cfg(desktop)]
+                webview: features.opener.webview,
+                #[cfg(windows)]
+                environment: features.opener.environment,
+                #[cfg(target_os = "macos")]
+                target_configuration: features.opener.target_configuration,
+              },
+            ),
+          );
+          match response {
+            tauri_runtime::webview::NewWindowResponse::Allow => wry::NewWindowResponse::Allow,
+            #[cfg(desktop)]
+            tauri_runtime::webview::NewWindowResponse::Create { window_id } => {
+              let windows = &context.main_thread.windows.0;
+              let webview = loop {
+                if let Some(webview) = windows.try_borrow().ok().and_then(|windows| {
+                  windows
+                    .get(&window_id)
+                    .map(|window| window.webviews.first().unwrap().clone())
+                }) {
+                  break webview;
+                } else {
+                  // on Windows the window is created async so we should wait for it to be available
+                  std::thread::sleep(std::time::Duration::from_millis(50));
+                  continue;
+                };
+              };
+
+              #[cfg(desktop)]
+              wry::NewWindowResponse::Create {
+                #[cfg(target_os = "macos")]
+                webview: wry::WebViewExtMacOS::webview(&*webview).as_super().into(),
+                #[cfg(any(
+                  target_os = "linux",
+                  target_os = "dragonfly",
+                  target_os = "freebsd",
+                  target_os = "netbsd",
+                  target_os = "openbsd",
+                ))]
+                webview: webview.webview(),
+                #[cfg(windows)]
+                webview: webview.webview(),
+              }
+            }
+            tauri_runtime::webview::NewWindowResponse::Deny => wry::NewWindowResponse::Deny,
+          }
+        })
+        .unwrap_or(wry::NewWindowResponse::Deny)
+    });
+  }
+
+  if let Some(document_title_changed_handler) = pending.document_title_changed_handler {
+    webview_builder =
+      webview_builder.with_document_title_changed_handler(document_title_changed_handler)
   }
 
   let webview_bounds = if let Some(bounds) = webview_attributes.bounds {
@@ -4635,11 +4832,22 @@ fn create_webview<T: UserEvent>(
       webview_builder = webview_builder.with_additional_browser_args(&additional_browser_args);
     }
 
+    if let Some(environment) = webview_attributes.environment {
+      webview_builder = webview_builder.with_environment(environment);
+    }
+
     webview_builder = webview_builder.with_theme(match window.theme() {
       TaoTheme::Dark => wry::Theme::Dark,
       TaoTheme::Light => wry::Theme::Light,
       _ => wry::Theme::Light,
     });
+
+    webview_builder =
+      webview_builder.with_scroll_bar_style(match webview_attributes.scroll_bar_style {
+        ScrollBarStyle::Default => WryScrollBarStyle::Default,
+        ScrollBarStyle::FluentOverlay => WryScrollBarStyle::FluentOverlay,
+        _ => unreachable!(),
+      });
   }
 
   #[cfg(windows)]
@@ -4659,6 +4867,19 @@ fn create_webview<T: UserEvent>(
   {
     if let Some(path) = &webview_attributes.extensions_path {
       webview_builder = webview_builder.with_extensions_path(path);
+    }
+  }
+
+  #[cfg(any(
+    target_os = "linux",
+    target_os = "dragonfly",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd"
+  ))]
+  {
+    if let Some(related_view) = webview_attributes.related_view {
+      webview_builder = webview_builder.with_related_view(related_view);
     }
   }
 
@@ -4811,8 +5032,7 @@ fn create_webview<T: UserEvent>(
   #[cfg(windows)]
   {
     let controller = webview.controller();
-    let proxy = context.proxy.clone();
-    let proxy_ = proxy.clone();
+    let proxy_clone = context.proxy.clone();
     let window_id_ = window_id.clone();
     let mut token = 0;
     unsafe {
@@ -4827,7 +5047,7 @@ fn create_webview<T: UserEvent>(
           focused_webview.replace(label_.clone());
 
           if !already_focused {
-            let _ = proxy.send_event(Message::Webview(
+            let _ = proxy_clone.send_event(Message::Webview(
               *window_id_.lock().unwrap(),
               id,
               WebviewMessage::SynthesizedWindowEvent(SynthesizedWindowEvent::Focused(true)),
@@ -4841,10 +5061,11 @@ fn create_webview<T: UserEvent>(
     .unwrap();
     unsafe {
       let label_ = label.clone();
-      let focused_webview_ = focused_webview.clone();
+      let window_id_ = window_id.clone();
+      let proxy_clone = context.proxy.clone();
       controller.add_LostFocus(
         &FocusChangedEventHandler::create(Box::new(move |_, _| {
-          let mut focused_webview = focused_webview_.lock().unwrap();
+          let mut focused_webview = focused_webview.lock().unwrap();
           // when using multiwebview mode, we should handle webview focus changes
           // so we check is the currently focused webview matches this webview's
           // (in this case, it means we lost the window focus)
@@ -4857,8 +5078,8 @@ fn create_webview<T: UserEvent>(
           if lost_window_focus {
             // only reset when we lost window focus - otherwise some other webview is focused
             *focused_webview = None;
-            let _ = proxy_.send_event(Message::Webview(
-              *window_id.lock().unwrap(),
+            let _ = proxy_clone.send_event(Message::Webview(
+              *window_id_.lock().unwrap(),
               id,
               WebviewMessage::SynthesizedWindowEvent(SynthesizedWindowEvent::Focused(false)),
             ));
@@ -4869,6 +5090,26 @@ fn create_webview<T: UserEvent>(
       )
     }
     .unwrap();
+
+    if let Ok(webview) = unsafe { controller.CoreWebView2() } {
+      let proxy_clone = context.proxy.clone();
+      unsafe {
+        let _ = webview.add_ContainsFullScreenElementChanged(
+          &ContainsFullScreenElementChangedEventHandler::create(Box::new(move |sender, _| {
+            let mut contains_fullscreen_element = windows::core::BOOL::default();
+            sender
+              .ok_or_else(windows::core::Error::empty)?
+              .ContainsFullScreenElement(&mut contains_fullscreen_element)?;
+            let _ = proxy_clone.send_event(Message::Window(
+              *window_id.lock().unwrap(),
+              WindowMessage::SetFullscreen(contains_fullscreen_element.as_bool()),
+            ));
+            Ok(())
+          })),
+          &mut token,
+        );
+      }
+    }
   }
 
   Ok(WebviewWrapper {
@@ -4938,4 +5179,12 @@ fn inner_size(
   has_children: bool,
 ) -> TaoPhysicalSize<u32> {
   window.inner_size()
+}
+
+fn to_tao_theme(theme: Option<Theme>) -> Option<TaoTheme> {
+  match theme {
+    Some(Theme::Light) => Some(TaoTheme::Light),
+    Some(Theme::Dark) => Some(TaoTheme::Dark),
+    _ => None,
+  }
 }

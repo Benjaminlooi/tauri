@@ -1,5 +1,17 @@
 # Changelog
 
+## \[2.3.0]
+
+### Enhancements
+
+- [`f59bf9d53`](https://www.github.com/tauri-apps/tauri/commit/f59bf9d5392ffd209e26ce5259c26d1acc31c4ba) ([#14337](https://www.github.com/tauri-apps/tauri/pull/14337) by [@FabianLars](https://www.github.com/tauri-apps/tauri/../../FabianLars)) **Potentially breaking change:** Export custom Error enum instead of using anyhow. The changes happened in https://github.com/tauri-apps/tauri/pull/14126.
+
+## \[2.2.0]
+
+### New Features
+
+- [`a9ec12843`](https://www.github.com/tauri-apps/tauri/commit/a9ec12843aa7d0eb774bd3a53e2e63da12cfa77b) ([#13521](https://www.github.com/tauri-apps/tauri/pull/13521) by [@FabianLars](https://www.github.com/tauri-apps/tauri/../../FabianLars)) Added a `--skip-stapling` option to make `tauri build|bundle` *not* wait for notarization to finish on macOS.
+
 ## \[2.1.0]
 
 ### Enhancements
